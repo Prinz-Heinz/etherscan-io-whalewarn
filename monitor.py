@@ -12,7 +12,7 @@ MARKET_CAP_CACHE_FILE = "market_cap_cache.json"
 
 # Sensitive configuration loaded from environment
 ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL_OLD")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 USER_IDS = os.getenv("USER_IDS", "").split(",") if os.getenv("USER_IDS") else []
 ROLE_IDS = os.getenv("ROLE_IDS", "").split(",") if os.getenv("ROLE_IDS") else []
 
@@ -22,7 +22,7 @@ if not ETHERSCAN_API_KEY or not WEBHOOK_URL:
 
 ITERATION_LIMIT = 10
 LOOKBACK_BLOCKS = 500
-SUMMARY_INTERVAL = 30 * 60  # 30 minutes, actually ~1 hour because polling rate is 10 seconds 30 * 60 * 10
+SUMMARY_INTERVAL = 12 * 60 * 60 # Summary every 12 hours
 MARKET_CAP_REFRESH_INTERVAL = 900
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 BLOCK_WINDOW = LOOKBACK_BLOCKS
@@ -71,8 +71,12 @@ def debug(msg):
     print(f"[DEBUG] {datetime.datetime.now().isoformat()} | {msg}")
 
 if os.path.exists(MARKET_CAP_CACHE_FILE):
-    with open(MARKET_CAP_CACHE_FILE, "r") as f:
-        market_cap_cache = json.load(f)
+    try:
+        with open(MARKET_CAP_CACHE_FILE, "r") as f:
+            market_cap_cache = json.load(f)
+    except (json.JSONDecodeError, ValueError):
+        print("[DEBUG] market_cap_cache.json was empty or corrupt — resetting.")
+        market_cap_cache = {}
 else:
     market_cap_cache = {}
 
@@ -169,10 +173,14 @@ def send_webhook_alert(alert, user_ids=USER_IDS, role_ids=ROLE_IDS):
     sym = alert.get("token", "")
     color = 0x00BFFF
     title = f"ℹ️ Alert: {sym}"
-    if "Exchange" in reason: title, color = f"🚨 Exchange Activity: {sym}", 0xFF0000
-    elif "Large Transfer" in reason: title, color = f"⚠️ Large Transfer: {sym}", 0xFFA500
-    elif "Activity Spike" in reason: title, color = f"📈 Activity Spike: {sym}", 0xFFD700
+    if "Exchange" in reason:
+        title, color = f"🚨 Exchange Activity: {sym}", 0xFF0000
+    elif "Large Transfer" in reason:
+        title, color = f"⚠️ Large Transfer: {sym}", 0xFFA500
+    elif "Activity Spike" in reason:
+        title, color = f"📈 Activity Spike: {sym}", 0xFFD700
 
+    # --- Build embed ---
     fields = [
         {"name": "Token", "value": sym, "inline": True},
         {"name": "USD Value", "value": f"${alert.get('usd_value',0):,.2f}", "inline": True},
@@ -198,8 +206,22 @@ def send_webhook_alert(alert, user_ids=USER_IDS, role_ids=ROLE_IDS):
         "footer": {"text": ""},
         "timestamp": datetime.datetime.now(timezone.utc).isoformat()
     }
+
+    # --- Mentions (for non-summary alerts) ---
+    mentions = []
+    if user_ids:
+        mentions += [f"<@{uid.strip()}>" for uid in user_ids if uid.strip()]
+    if role_ids:
+        mentions += [f"<@&{rid.strip()}>" for rid in role_ids if rid.strip()]
+
+    mention_text = " ".join(mentions)
+    payload = {"embeds": [embed]}
+
+    if mention_text:
+        payload["content"] = mention_text
+
     try:
-        r = requests.post(WEBHOOK_URL, json={"embeds": [embed]}, timeout=10)
+        r = requests.post(WEBHOOK_URL, json=payload, timeout=10)
         debug(f"Webhook {r.status_code} {sym}: {r.text[:80]}")
     except Exception as e:
         debug(f"Webhook failed: {e}")
@@ -223,7 +245,7 @@ def summarize_cycle(events):
         "title": "📊 Summary Report",
         "description": description.strip(),
         "color": 0x00BFFF,
-        "footer": {"text": "Hourly Summary"},
+        "footer": {"text": "Summary of Activities"},
         "timestamp": datetime.datetime.now(timezone.utc).isoformat()
     }
 
