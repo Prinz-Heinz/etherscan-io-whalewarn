@@ -1,3 +1,16 @@
+#!/usr/bin/env python3
+"""
+monitor.py
+Etherscan-based early warning monitor with:
+- inflow-only large transfer detection (pings)
+- exchange inflow detection (pings)
+- bounce/round-trip suppression
+- activity spike detection on inflows only
+- normal spikes are quiet; extreme spikes ping
+- summary always posted (even if no events)
+- environment-driven config (.env) with comma-separated USER_IDS and ROLE_IDS
+"""
+
 from dotenv import load_dotenv
 import os, json, time, requests, datetime
 from datetime import timezone
@@ -13,23 +26,34 @@ MARKET_CAP_CACHE_FILE = "market_cap_cache.json"
 # Sensitive configuration loaded from environment
 ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-USER_IDS = os.getenv("USER_IDS", "").split(",") if os.getenv("USER_IDS") else []
-ROLE_IDS = os.getenv("ROLE_IDS", "").split(",") if os.getenv("ROLE_IDS") else []
+# Comma-separated lists supported
+USER_IDS = [s.strip() for s in os.getenv("USER_IDS", "").split(",") if s.strip()]
+ROLE_IDS = [s.strip() for s in os.getenv("ROLE_IDS", "").split(",") if s.strip()]
 
-# Safety check
-if not ETHERSCAN_API_KEY or not WEBHOOK_URL:
-    raise ValueError("Missing ETHERSCAN_API_KEY or WEBHOOK_URL in environment variables. Please check your .env file.")
+# Safety check (we allow DRY run with no webhook)
+if not ETHERSCAN_API_KEY:
+    raise ValueError("Missing ETHERSCAN_API_KEY in environment variables. Please check your .env file.")
 
 ITERATION_LIMIT = 10
 LOOKBACK_BLOCKS = 500
-SUMMARY_INTERVAL = 12 * 60 * 60 # Summary every 12 hours
+SUMMARY_INTERVAL = 12 * 60 * 60  # Summary every 12 hours
 MARKET_CAP_REFRESH_INTERVAL = 900
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
+
 BLOCK_WINDOW = LOOKBACK_BLOCKS
 SCAN_INTERVAL = ITERATION_LIMIT
-SPIKE_MULTIPLIER = 3.0
+
+# Spike multipliers
+SPIKE_MULTIPLIER = 3.0  # historical average multiplier used for history-based baseline (kept for compatibility)
 MIN_ACTIVITY_USD = 150_000
 activity_history = defaultdict(lambda: deque(maxlen=10))
+
+# New thresholds for tiered spike behavior
+SPIKE_THRESHOLD_MULTIPLIER = 3.0   # normal spike must exceed dynamic threshold * 3
+SPIKE_PING_MULTIPLIER = 6.0        # extreme spike must exceed dynamic threshold * 6 to ping
+
+# Bounce tolerance (percent)
+BOUNCE_TOLERANCE_PCT = 1.0  # 1% by default
 
 last_summary_time = time.time()
 summary_buffer = []
@@ -75,7 +99,7 @@ if os.path.exists(MARKET_CAP_CACHE_FILE):
         with open(MARKET_CAP_CACHE_FILE, "r") as f:
             market_cap_cache = json.load(f)
     except (json.JSONDecodeError, ValueError):
-        print("[DEBUG] market_cap_cache.json was empty or corrupt — resetting.")
+        debug("market_cap_cache.json was empty or corrupt — resetting.")
         market_cap_cache = {}
 else:
     market_cap_cache = {}
@@ -86,9 +110,14 @@ def is_external_to_hot(tx, token_contract_address=None):
         from_addr = tx.get("from", "").lower()
         if not to_addr or not from_addr:
             return False
-        if to_addr not in HOT_WALLETS or from_addr in HOT_WALLETS:
+        # External -> hot: to is hot, from is not hot, and not genesis
+        if to_addr not in HOT_WALLETS:
             return False
-        if from_addr == ZERO_ADDRESS or (token_contract_address and from_addr == token_contract_address.lower()):
+        if from_addr in HOT_WALLETS:
+            return False
+        if from_addr == ZERO_ADDRESS:
+            return False
+        if token_contract_address and from_addr == token_contract_address.lower():
             return False
         return True
     except Exception as e:
@@ -123,6 +152,8 @@ def calculate_dynamic_threshold(market_cap_usd, symbol=None):
 def get_market_cap(symbol):
     try:
         cid = COINGECKO_IDS.get(symbol)
+        if not cid:
+            return None
         r = requests.get(f"https://api.coingecko.com/api/v3/coins/{cid}", timeout=10)
         cap = r.json()["market_data"]["market_cap"]["usd"]
         debug(f"{symbol} market cap ${cap:,.0f}")
@@ -163,12 +194,16 @@ def get_txns(address, start_block, end_block):
 
 # ---------------- Alerts ----------------
 def send_webhook_alert(alert, user_ids=USER_IDS, role_ids=ROLE_IDS):
+    """
+    Send an alert to the configured webhook. Provide per-call user_ids / role_ids
+    to control mentions (passed as content).
+    """
     if not WEBHOOK_URL:
-        debug(f"[DRY] Would send alert: {alert}")
+        debug(f"[DRY] Would send alert: {json.dumps(alert, default=str)}")
         return
 
     tx_hash = alert.get("hash", "")
-    etherscan_url = f"https://etherscan.io/tx/{tx_hash}" if tx_hash != "N/A" else None
+    etherscan_url = f"https://etherscan.io/tx/{tx_hash}" if tx_hash and tx_hash != "N/A" else None
     reason = alert.get("reason", "")
     sym = alert.get("token", "")
     color = 0x00BFFF
@@ -177,19 +212,19 @@ def send_webhook_alert(alert, user_ids=USER_IDS, role_ids=ROLE_IDS):
         title, color = f"🚨 Exchange Activity: {sym}", 0xFF0000
     elif "Large Transfer" in reason:
         title, color = f"⚠️ Large Transfer: {sym}", 0xFFA500
-    elif "Activity Spike" in reason:
+    elif "Activity Spike" in reason or "spike" in reason.lower():
         title, color = f"📈 Activity Spike: {sym}", 0xFFD700
 
     # --- Build embed ---
     fields = [
-        {"name": "Token", "value": sym, "inline": True},
+        {"name": "Token", "value": sym or "Unknown", "inline": True},
         {"name": "USD Value", "value": f"${alert.get('usd_value',0):,.2f}", "inline": True},
         {"name": "Block", "value": str(alert.get("block","N/A")), "inline": True},
         {"name": "Risk Score", "value": str(alert.get("risk_score","?")), "inline": True}
     ]
 
     extra = alert.get("extra", {})
-    if extra.get("pct_change"):
+    if extra.get("pct_change") is not None:
         fields.append({"name": "Change", "value": f"{extra['pct_change']}%", "inline": True})
     if extra.get("top_tx_links_md"):
         fields.append({"name": "Top Transactions", "value": extra["top_tx_links_md"], "inline": False})
@@ -203,26 +238,24 @@ def send_webhook_alert(alert, user_ids=USER_IDS, role_ids=ROLE_IDS):
         "description": reason,
         "color": color,
         "fields": fields,
-        "footer": {"text": ""},
+        "footer": {"text": "Etherscan Early Warning Monitor"},
         "timestamp": datetime.datetime.now(timezone.utc).isoformat()
     }
 
-    # --- Mentions (for non-summary alerts) ---
+    # Build mention content (Discord will expand these identifiers)
     mentions = []
     if user_ids:
-        mentions += [f"<@{uid.strip()}>" for uid in user_ids if uid.strip()]
+        mentions += [f"<@{uid}>" for uid in user_ids if uid and uid.strip()]
     if role_ids:
-        mentions += [f"<@&{rid.strip()}>" for rid in role_ids if rid.strip()]
+        mentions += [f"<@&{rid}>" for rid in role_ids if rid and rid.strip()]
 
-    mention_text = " ".join(mentions)
     payload = {"embeds": [embed]}
-
-    if mention_text:
-        payload["content"] = mention_text
+    if mentions:
+        payload["content"] = " ".join(mentions)
 
     try:
         r = requests.post(WEBHOOK_URL, json=payload, timeout=10)
-        debug(f"Webhook {r.status_code} {sym}: {r.text[:80]}")
+        debug(f"Webhook {r.status_code} {sym}: {r.text[:120]}")
     except Exception as e:
         debug(f"Webhook failed: {e}")
 
@@ -268,8 +301,11 @@ else:
         f"Polling interval: {ITERATION_LIMIT}s\n"
         f"Startup: {datetime.datetime.now(timezone.utc).isoformat()}"
     )
-    requests.post(WEBHOOK_URL, json={"content": startup_message})
-    debug("Startup message sent to Discord.")
+    try:
+        requests.post(WEBHOOK_URL, json={"content": startup_message}, timeout=10)
+        debug("Startup message sent to Discord.")
+    except Exception as e:
+        debug(f"Startup webhook failed: {e}")
 
 # ---------------- Main Loop ----------------
 recent_tx_hashes = set()
@@ -287,41 +323,112 @@ while True:
                 if not txns:
                     continue
 
-                large_transfer_alerts = []
-                external_hot_tx_links, external_hot_volume_usd = [], 0
-                total_volume_usd = 0
-
+                # ---- Parse txns and dedupe by hash ----
+                parsed = []
                 for tx in txns:
-                    tx_hash = tx["hash"]
-                    if tx_hash in recent_tx_hashes:
+                    try:
+                        tx_hash = tx.get("hash")
+                        if not tx_hash:
+                            continue
+                        if tx_hash in recent_tx_hashes:
+                            continue
+                        # mark seen
+                        recent_tx_hashes.add(tx_hash)
+
+                        from_addr = tx.get("from", "").lower()
+                        to_addr = tx.get("to", "").lower()
+                        blocknum = int(tx.get("blockNumber", 0))
+                        # Some token transfer endpoints put token amount in "value" (works here)
+                        value_eth = int(tx.get("value", 0)) / 1e18
+                        usd_value = value_eth * (market_cap / 1_000_000_000)
+
+                        parsed.append({
+                            "hash": tx_hash,
+                            "from": from_addr,
+                            "to": to_addr,
+                            "block": blocknum,
+                            "value_eth": value_eth,
+                            "usd": usd_value,
+                            "raw": tx
+                        })
+                    except Exception as e:
+                        debug(f"TX parse error: {e}")
                         continue
-                    recent_tx_hashes.add(tx_hash)
 
-                    value_eth = int(tx["value"]) / 1e18
-                    usd_value = value_eth * (market_cap / 1_000_000_000)
-                    total_volume_usd += usd_value
+                # ---- Partition inflows (external -> hot) and outflows (hot -> external) ----
+                inflows = []
+                outflows = []
+                for p in parsed:
+                    if p["to"] in HOT_WALLETS and p["from"] not in HOT_WALLETS and p["from"] != ZERO_ADDRESS:
+                        inflows.append(p)
+                    elif p["from"] in HOT_WALLETS and p["to"] not in HOT_WALLETS:
+                        outflows.append(p)
+                    # other directions ignored for inflow accounting
 
-                    if usd_value > threshold:
+                # ---- Bounce / round-trip suppression within this scan ----
+                bounce_ignored_hashes = set()
+                out_by_target = defaultdict(list)
+                for o in outflows:
+                    out_by_target[o["to"]].append(o)
+
+                for inf in inflows:
+                    origin = inf["from"]
+                    candidates = out_by_target.get(origin, [])
+                    matched = None
+                    for o in candidates:
+                        # return should be at or after inflow block
+                        if o["block"] < inf["block"]:
+                            continue
+                        # only consider returns within block window to avoid long-term matches
+                        if o["block"] - inf["block"] > BLOCK_WINDOW:
+                            continue
+                        # amount similarity tolerance
+                        if abs(o["usd"] - inf["usd"]) / max(inf["usd"], 1) * 100 <= BOUNCE_TOLERANCE_PCT:
+                            matched = o
+                            break
+                    if matched:
+                        bounce_ignored_hashes.add(inf["hash"])
+                        bounce_ignored_hashes.add(matched["hash"])
+                        debug(f"[BOUNCE] Matched bounce: IN {inf['hash']} and OUT {matched['hash']} (~${inf['usd']:,.2f})")
+
+                # ---- Compute inflow totals excluding bounces ----
+                external_hot_tx_links = []
+                external_hot_volume_usd = 0.0
+                for inf in inflows:
+                    if inf["hash"] in bounce_ignored_hashes:
+                        debug(f"[BOUNCE] Ignoring inflow {inf['hash']} from {inf['from']} (${inf['usd']:,.2f})")
+                        continue
+                    external_hot_tx_links.append((inf["hash"], inf["from"], inf["usd"]))
+                    external_hot_volume_usd += inf["usd"]
+
+                total_inflow_usd = external_hot_volume_usd
+                # keep total churn for debugging if needed
+                total_volume_usd = sum(p["usd"] for p in parsed)
+
+                # ---- Large transfer alerts (INFLOW ONLY) ----
+                large_transfer_alerts = []
+                for inf in inflows:
+                    if inf["hash"] in bounce_ignored_hashes:
+                        continue
+                    if inf["usd"] > threshold:
                         large_transfer_alerts.append({
                             "token": sym,
                             "type": "Large Transfer",
-                            "reason": f"Single large transfer of ${usd_value:,.2f} to {tx['to']}",
-                            "usd_value": usd_value,
-                            "hash": tx_hash,
-                            "block": tx["blockNumber"],
+                            "reason": f"Single large transfer of ${inf['usd']:,.2f} to {inf['to']}",
+                            "usd_value": inf['usd'],
+                            "hash": inf['hash'],
+                            "block": inf['block'],
                             "risk_score": 8
                         })
 
-                    if is_external_to_hot(tx, addr):
-                        external_hot_tx_links.append((tx_hash, tx["from"], usd_value))
-                        external_hot_volume_usd += usd_value
-
+                # ---- Exchange inflow detection (inflow-only) ----
                 if external_hot_volume_usd > threshold:
                     reason = f"Exchange inflow detected: ${external_hot_volume_usd:,.2f} > ${threshold:,.2f}"
                     tx_links_md = "\n".join([
                         f"[{h}](https://etherscan.io/tx/{h}) — `{frm}` — ${val:,.2f}"
                         for h, frm, val in external_hot_tx_links[:10]
                     ])
+                    # Exchange inflow is considered suspicious — ping
                     send_webhook_alert({
                         "token": sym,
                         "reason": reason,
@@ -330,7 +437,8 @@ while True:
                         "block": f"{start_block}-{end_block}",
                         "risk_score": 9,
                         "extra": {"sample_tx_links_md": tx_links_md}
-                    })
+                    }, user_ids=USER_IDS, role_ids=ROLE_IDS)
+
                     summary_buffer.append({
                         "token": sym,
                         "type": "Exchange Inflow",
@@ -339,51 +447,78 @@ while True:
                         "total_usd": external_hot_volume_usd
                     })
 
+                # ---- Activity spike detection (inflow-only; tiered pings) ----
                 hist = activity_history[sym]
                 avg_prev = sum(hist)/len(hist) if hist else 0
-                hist.append(total_volume_usd)
-                cap_threshold = threshold
-                spike_threshold = max(cap_threshold, MIN_ACTIVITY_USD, avg_prev * SPIKE_MULTIPLIER)
+                hist.append(total_inflow_usd)
 
-                if len(hist) >= 3 and total_volume_usd > spike_threshold:
-                    pct_change = (total_volume_usd / max(avg_prev, 1)) * 100 - 100
+                cap_threshold = threshold
+                # Dynamic tiered thresholds
+                normal_spike_threshold = max(cap_threshold * SPIKE_THRESHOLD_MULTIPLIER, MIN_ACTIVITY_USD, avg_prev * SPIKE_MULTIPLIER)
+                extreme_spike_threshold = cap_threshold * SPIKE_PING_MULTIPLIER
+
+                spike_type = None
+                if total_inflow_usd > extreme_spike_threshold:
+                    spike_type = "extreme"
+                elif total_inflow_usd > normal_spike_threshold:
+                    spike_type = "normal"
+
+                if len(hist) >= 3 and spike_type:
+                    pct_change = (total_inflow_usd / max(avg_prev, 1)) * 100 - 100
                     reason = (
-                        f"Abnormal activity spike: ${total_volume_usd:,.2f} "
-                        f"(avg ${avg_prev:,.2f}, threshold ${spike_threshold:,.2f}, +{pct_change:.1f}%)"
+                        f"Abnormal activity spike: ${total_inflow_usd:,.2f} "
+                        f"(avg ${avg_prev:,.2f}, threshold ${normal_spike_threshold:,.2f}, +{pct_change:.1f}%)"
                     )
-                    sorted_txns = sorted(txns, key=lambda x: int(x["value"]), reverse=True)
+
+                    # create top tx md from inflows only
+                    sorted_inflows = sorted([i for i in inflows if i["hash"] not in bounce_ignored_hashes], key=lambda x: x["usd"], reverse=True)
                     top_tx_links = []
-                    for tx in sorted_txns[:3]:
-                        h = tx["hash"]
-                        v = int(tx["value"]) / 1e18
-                        usd = v * (market_cap / 1_000_000_000)
-                        sh, to = f"{h[:6]}…{h[-4:]}", tx["to"]
-                        sto = f"{to[:6]}…{to[-4:]}"
-                        top_tx_links.append(f"[{sh}](https://etherscan.io/tx/{h}) → `{sto}` (${usd:,.0f})")
+                    for tx in sorted_inflows[:5]:
+                        tx_hash = tx["hash"]
+                        usd_val = tx["usd"]
+                        to_addr = tx["to"]
+                        top_tx_links.append(f"[{tx_hash}](https://etherscan.io/tx/{tx_hash}) — ${usd_val:,.2f} → {to_addr[:10]}")
+
                     top_tx_md = "\n".join(top_tx_links)
                     if len(top_tx_md) > 900:
-                        top_tx_md = "; ".join([l.split('→')[0] for l in top_tx_links]) + " …"
+                        top_tx_md = "; ".join([l.split('—')[0] for l in top_tx_links]) + " …"
+
+                    # Normal spikes: silent (no mention), Extreme spikes: ping
+                    spike_user_ids = USER_IDS if spike_type == "extreme" else []
+                    spike_role_ids = ROLE_IDS if spike_type == "extreme" else []
+
                     send_webhook_alert({
                         "token": sym,
                         "reason": reason,
-                        "usd_value": total_volume_usd,
+                        "usd_value": total_inflow_usd,
                         "hash": "N/A",
                         "block": f"{start_block}-{end_block}",
-                        "risk_score": 7,
+                        "risk_score": 7 if spike_type == "normal" else 9,
                         "extra": {"pct_change": round(pct_change, 1), "top_tx_links_md": top_tx_md}
-                    })
+                    }, user_ids=spike_user_ids, role_ids=spike_role_ids)
+
                     summary_buffer.append({
                         "token": sym,
                         "type": "Activity Spike",
                         "reason": reason,
-                        "event_count": len(txns),
-                        "total_usd": total_volume_usd
+                        "event_count": len(inflows),
+                        "total_usd": total_inflow_usd
                     })
 
+                # ---- Send large-transfer alerts (inflow-only) ----
                 for alert in large_transfer_alerts:
-                    send_webhook_alert(alert)
+                    # Large transfer is worthy of a ping (per your request)
+                    send_webhook_alert({
+                        "token": alert["token"],
+                        "reason": alert["reason"],
+                        "usd_value": alert["usd_value"],
+                        "hash": alert["hash"],
+                        "block": alert["block"],
+                        "risk_score": alert.get("risk_score", 8),
+                        "extra": {}
+                    }, user_ids=USER_IDS, role_ids=ROLE_IDS)
                     summary_buffer.append({
-                        "token": sym,
+                        "token": alert["token"],
                         "type": alert["type"],
                         "reason": alert["reason"],
                         "event_count": 1,
@@ -393,6 +528,7 @@ while True:
             except Exception as token_err:
                 debug(f"Token {sym} error: {token_err}")
 
+        # --- Summary dispatch ---
         now_time = time.time()
         if now_time - last_summary_time >= SUMMARY_INTERVAL:
             debug(f"Sending summary ({len(summary_buffer)} events).")
